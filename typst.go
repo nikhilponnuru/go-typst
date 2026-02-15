@@ -1,0 +1,235 @@
+// Package typst provides Go bindings for the Typst markup language compiler.
+// It compiles Typst source into PDF using the Typst Rust crate via CGO.
+//
+// Create a [Compiler] with [New], then call [Compiler.Compile] or
+// [Compiler.CompileBytes]. Each Compiler is an independent instance
+// with its own fonts and caches — safe for concurrent use and free
+// of cross-instance contention.
+package typst
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/typst-ffi
+#cgo LDFLAGS: -L${SRCDIR}/typst-ffi/target/release -ltypst_ffi -lm -liconv
+#cgo darwin LDFLAGS: -framework CoreFoundation -framework Security
+#cgo linux LDFLAGS: -lpthread -ldl
+
+#include <stdlib.h>
+#include "typst_ffi.h"
+*/
+import "C"
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"runtime"
+	"sync"
+	"unsafe"
+)
+
+// CompileError represents a Typst compilation error.
+type CompileError struct {
+	Message string
+}
+
+func (e *CompileError) Error() string {
+	return e.Message
+}
+
+// Compiler is an independent Typst compiler instance with its own fonts
+// and internal caches. It is safe for concurrent use from multiple goroutines.
+//
+// Create with [New] and free with [Compiler.Close].
+type Compiler struct {
+	world  *C.TypstWorld
+	once   sync.Once
+	closed bool
+}
+
+// New creates a new Compiler. The bundled default fonts (Libertinus Serif,
+// New Computer Modern, DejaVu Sans Mono) are always loaded. Any additional
+// font bytes (ttf/otf) passed here are loaded on top.
+//
+// Multiple Compilers are fully independent — different fonts, no shared
+// locks, no contention.
+func New(fonts ...[]byte) (*Compiler, error) {
+	var world *C.TypstWorld
+
+	if len(fonts) == 0 {
+		world = C.typst_world_new(nil, nil, 0)
+	} else {
+		n := len(fonts)
+		cPtrs := (*[1 << 30]*C.uint8_t)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.uint8_t)(nil)))))[:n:n]
+		cLens := (*[1 << 30]C.size_t)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.size_t(0)))))[:n:n]
+		defer C.free(unsafe.Pointer(&cPtrs[0]))
+		defer C.free(unsafe.Pointer(&cLens[0]))
+
+		for i, f := range fonts {
+			if len(f) == 0 {
+				cPtrs[i] = nil
+				cLens[i] = 0
+				continue
+			}
+			cPtrs[i] = (*C.uint8_t)(unsafe.Pointer(&f[0]))
+			cLens[i] = C.size_t(len(f))
+		}
+
+		world = C.typst_world_new(
+			(**C.uint8_t)(unsafe.Pointer(&cPtrs[0])),
+			(*C.size_t)(unsafe.Pointer(&cLens[0])),
+			C.size_t(n),
+		)
+	}
+
+	if world == nil {
+		return nil, errors.New("typst: failed to create compiler")
+	}
+
+	c := &Compiler{world: world}
+	runtime.SetFinalizer(c, (*Compiler).free)
+	return c, nil
+}
+
+// Compile reads Typst source from r and compiles it into a PDF.
+// The returned [Document] directly references the compiled PDF in
+// Rust-allocated memory with no copy. Call [Document.Close] when done.
+func (c *Compiler) Compile(r io.Reader) (*Document, error) {
+	source, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading typst source: %w", err)
+	}
+	return c.compile(source)
+}
+
+// CompileBytes compiles Typst source bytes directly into a PDF.
+// This is the fastest path — avoids the io.ReadAll allocation.
+// The source slice is not retained after the call.
+func (c *Compiler) CompileBytes(source []byte) (*Document, error) {
+	return c.compile(source)
+}
+
+func (c *Compiler) compile(source []byte) (*Document, error) {
+	if c.closed {
+		return nil, errors.New("typst: compiler is closed")
+	}
+	if len(source) == 0 {
+		return nil, &CompileError{Message: "empty source"}
+	}
+
+	result := C.typst_world_compile(
+		c.world,
+		(*C.uint8_t)(unsafe.Pointer(&source[0])),
+		C.size_t(len(source)),
+	)
+
+	if result.error != 0 {
+		msg := C.GoBytes(unsafe.Pointer(result.data), C.int(result.len))
+		C.typst_free_result(result.data, result.len)
+		return nil, &CompileError{Message: string(msg)}
+	}
+
+	doc := &Document{
+		data: result.data,
+		len:  result.len,
+	}
+	runtime.SetFinalizer(doc, (*Document).free)
+	return doc, nil
+}
+
+// Close frees the compiler and all its internal resources.
+// After Close, Compile/CompileBytes return errors.
+// Close is idempotent.
+func (c *Compiler) Close() error {
+	c.free()
+	return nil
+}
+
+func (c *Compiler) free() {
+	c.once.Do(func() {
+		if c.world != nil {
+			C.typst_world_free(c.world)
+		}
+		c.world = nil
+		c.closed = true
+		runtime.SetFinalizer(c, nil)
+	})
+}
+
+// Document holds the compiled PDF output backed by Rust-allocated memory.
+// It provides zero-copy access to the PDF bytes.
+//
+// Close must be called when the document is no longer needed to free
+// the underlying memory. After Close, all methods return errors and
+// any byte slices previously returned by [Document.Bytes] are invalid.
+type Document struct {
+	data   *C.uint8_t
+	len    C.size_t
+	offset int
+	once   sync.Once
+	closed bool
+}
+
+// Len returns the size of the PDF in bytes.
+func (d *Document) Len() int {
+	if d.closed {
+		return 0
+	}
+	return int(d.len)
+}
+
+// Bytes returns the raw PDF bytes backed directly by Rust-allocated memory.
+// Zero-copy — no allocation or copying occurs.
+//
+// The returned slice is valid only until Close is called.
+// Do not retain the slice beyond the lifetime of the Document.
+func (d *Document) Bytes() []byte {
+	if d.closed || d.len == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(d.data)), d.len)
+}
+
+// Read implements [io.Reader], reading from the PDF bytes.
+func (d *Document) Read(p []byte) (int, error) {
+	if d.closed {
+		return 0, errors.New("typst: read on closed document")
+	}
+	buf := d.Bytes()
+	if d.offset >= len(buf) {
+		return 0, io.EOF
+	}
+	n := copy(p, buf[d.offset:])
+	d.offset += n
+	return n, nil
+}
+
+// WriteTo implements [io.WriterTo], writing the entire PDF to w.
+// This writes directly from Rust-allocated memory with no intermediate copy.
+func (d *Document) WriteTo(w io.Writer) (int64, error) {
+	if d.closed {
+		return 0, errors.New("typst: write on closed document")
+	}
+	buf := d.Bytes()
+	n, err := w.Write(buf)
+	return int64(n), err
+}
+
+// Close frees the underlying Rust-allocated memory.
+// After Close, Bytes returns nil and Read/WriteTo return errors.
+// Close is idempotent.
+func (d *Document) Close() error {
+	d.free()
+	return nil
+}
+
+func (d *Document) free() {
+	d.once.Do(func() {
+		if d.data != nil {
+			C.typst_free_result(d.data, d.len)
+		}
+		d.data = nil
+		d.len = 0
+		d.closed = true
+		runtime.SetFinalizer(d, nil)
+	})
+}

@@ -1,0 +1,3 @@
+typst-ffi/target/
+testdata/*.pdf
+testdata/fonts/
