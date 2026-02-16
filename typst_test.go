@@ -3,6 +3,7 @@ package typst
 import (
 	"bytes"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -15,6 +16,15 @@ func newTestCompiler(t *testing.T) *Compiler {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func testdataDir(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs("testdata")
+	if err != nil {
+		t.Fatalf("failed to get testdata abs path: %v", err)
+	}
+	return abs
 }
 
 func TestCompile_simple(t *testing.T) {
@@ -213,6 +223,120 @@ func TestMultipleCompilers(t *testing.T) {
 
 	if !bytes.HasPrefix(doc1.Bytes(), []byte("%PDF-")) || !bytes.HasPrefix(doc2.Bytes(), []byte("%PDF-")) {
 		t.Fatal("one or both outputs are not PDFs")
+	}
+}
+
+func TestCompileFile(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileFile("testdata/sample.typ")
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestImage(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileFile("testdata/with_image.typ")
+	if err != nil {
+		t.Fatalf("CompileFile with image failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestImport(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileFile("testdata/with_import.typ")
+	if err != nil {
+		t.Fatalf("CompileFile with import failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestImport_WithRoot(t *testing.T) {
+	c := newTestCompiler(t)
+	root := testdataDir(t)
+	source := []byte(`#import "helper.typ": greet
+#greet("WithRoot")
+`)
+	doc, err := c.CompileBytes(source, WithRoot(root))
+	if err != nil {
+		t.Fatalf("CompileBytes with WithRoot failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestImage_WithRoot(t *testing.T) {
+	c := newTestCompiler(t)
+	root := testdataDir(t)
+	source := []byte(`#image("logo.png")`)
+	doc, err := c.CompileBytes(source, WithRoot(root))
+	if err != nil {
+		t.Fatalf("CompileBytes with image via WithRoot failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestPathTraversal(t *testing.T) {
+	c := newTestCompiler(t)
+	root := testdataDir(t)
+	source := []byte(`#image("../../etc/passwd")`)
+	_, err := c.CompileBytes(source, WithRoot(root))
+	if err == nil {
+		t.Fatal("expected error for path traversal, got nil")
+	}
+}
+
+func TestPackage(t *testing.T) {
+	c := newTestCompiler(t)
+	root := testdataDir(t)
+	pkgDir := filepath.Join(root, "packages")
+	source := []byte(`#import "@preview/example:0.1.0": example-func
+#example-func()
+`)
+	doc, err := c.CompileBytes(source, WithRoot(root), WithPackageDir(pkgDir))
+	if err != nil {
+		t.Fatalf("CompileBytes with package import failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+}
+
+func TestPackage_CompileFile(t *testing.T) {
+	c := newTestCompiler(t)
+	root := testdataDir(t)
+	pkgDir := filepath.Join(root, "packages")
+	doc, err := c.CompileFile("testdata/with_package.typ", WithPackageDir(pkgDir))
+	if err != nil {
+		t.Fatalf("CompileFile with package import failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.HasPrefix(doc.Bytes(), []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
 	}
 }
 

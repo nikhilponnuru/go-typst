@@ -9,8 +9,8 @@ package typst
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/typst-ffi
-#cgo LDFLAGS: -L${SRCDIR}/typst-ffi/target/release -ltypst_ffi -lm -liconv
-#cgo darwin LDFLAGS: -framework CoreFoundation -framework Security
+#cgo LDFLAGS: -L${SRCDIR}/typst-ffi/target/release -ltypst_ffi -lm
+#cgo darwin LDFLAGS: -liconv -framework CoreFoundation -framework Security
 #cgo linux LDFLAGS: -lpthread -ldl
 
 #include <stdlib.h>
@@ -22,10 +22,55 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"unsafe"
 )
+
+// CompileOption configures a single compilation call.
+type CompileOption func(*compileConfig)
+
+type compileConfig struct {
+	root       string
+	packageDir string
+}
+
+// WithRoot sets the root directory for resolving local file imports and images.
+// Paths in #import and #image() are resolved relative to this directory.
+// Path traversal outside the root is blocked.
+func WithRoot(dir string) CompileOption {
+	return func(cfg *compileConfig) {
+		cfg.root = dir
+	}
+}
+
+// WithPackageDir overrides the default package cache directory.
+// Typst packages are resolved at {dir}/{namespace}/{name}/{version}/.
+func WithPackageDir(dir string) CompileOption {
+	return func(cfg *compileConfig) {
+		cfg.packageDir = dir
+	}
+}
+
+// DefaultPackageDir returns the platform-specific default Typst package cache directory.
+// On Linux: ~/.cache/typst/packages/
+// On macOS: ~/Library/Caches/typst/packages/
+func DefaultPackageDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Caches", "typst", "packages")
+	}
+	// Linux and others: respect XDG_CACHE_HOME if set.
+	if cacheDir := os.Getenv("XDG_CACHE_HOME"); cacheDir != "" {
+		return filepath.Join(cacheDir, "typst", "packages")
+	}
+	return filepath.Join(home, ".cache", "typst", "packages")
+}
 
 // CompileError represents a Typst compilation error.
 type CompileError struct {
@@ -93,22 +138,44 @@ func New(fonts ...[]byte) (*Compiler, error) {
 // Compile reads Typst source from r and compiles it into a PDF.
 // The returned [Document] directly references the compiled PDF in
 // Rust-allocated memory with no copy. Call [Document.Close] when done.
-func (c *Compiler) Compile(r io.Reader) (*Document, error) {
+func (c *Compiler) Compile(r io.Reader, opts ...CompileOption) (*Document, error) {
 	source, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("reading typst source: %w", err)
 	}
-	return c.compile(source)
+	return c.compile(source, opts)
 }
 
 // CompileBytes compiles Typst source bytes directly into a PDF.
 // This is the fastest path — avoids the io.ReadAll allocation.
 // The source slice is not retained after the call.
-func (c *Compiler) CompileBytes(source []byte) (*Document, error) {
-	return c.compile(source)
+func (c *Compiler) CompileBytes(source []byte, opts ...CompileOption) (*Document, error) {
+	return c.compile(source, opts)
 }
 
-func (c *Compiler) compile(source []byte) (*Document, error) {
+// CompileFile reads and compiles a Typst file at the given path.
+// The file's directory is automatically used as the root for resolving
+// imports and images, unless overridden with [WithRoot].
+func (c *Compiler) CompileFile(path string, opts ...CompileOption) (*Document, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolving path: %w", err)
+	}
+	source, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading typst file: %w", err)
+	}
+
+	// Prepend WithRoot(dir) so user-supplied WithRoot can override it.
+	dir := filepath.Dir(absPath)
+	allOpts := make([]CompileOption, 0, len(opts)+1)
+	allOpts = append(allOpts, WithRoot(dir))
+	allOpts = append(allOpts, opts...)
+
+	return c.compile(source, allOpts)
+}
+
+func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, error) {
 	if c.closed {
 		return nil, errors.New("typst: compiler is closed")
 	}
@@ -116,10 +183,46 @@ func (c *Compiler) compile(source []byte) (*Document, error) {
 		return nil, &CompileError{Message: "empty source"}
 	}
 
+	var cfg compileConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Auto-detect default package dir if not explicitly set.
+	if cfg.packageDir == "" {
+		if dir := DefaultPackageDir(); dir != "" {
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				cfg.packageDir = dir
+			}
+		}
+	}
+
+	// Prepare C pointers for root.
+	var rootPtr *C.uint8_t
+	var rootLen C.size_t
+	if cfg.root != "" {
+		rootBytes := []byte(cfg.root)
+		rootPtr = (*C.uint8_t)(unsafe.Pointer(&rootBytes[0]))
+		rootLen = C.size_t(len(rootBytes))
+	}
+
+	// Prepare C pointers for package dir.
+	var pkgPtr *C.uint8_t
+	var pkgLen C.size_t
+	if cfg.packageDir != "" {
+		pkgBytes := []byte(cfg.packageDir)
+		pkgPtr = (*C.uint8_t)(unsafe.Pointer(&pkgBytes[0]))
+		pkgLen = C.size_t(len(pkgBytes))
+	}
+
 	result := C.typst_world_compile(
 		c.world,
 		(*C.uint8_t)(unsafe.Pointer(&source[0])),
 		C.size_t(len(source)),
+		rootPtr,
+		rootLen,
+		pkgPtr,
+		pkgLen,
 	)
 
 	if result.error != 0 {

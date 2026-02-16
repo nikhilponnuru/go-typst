@@ -5,6 +5,7 @@ A Go library for compiling [Typst](https://typst.app) markup into PDF, powered b
 - **Zero-copy output** — PDF bytes stay in Rust memory, never copied to the Go heap.
 - **Instance-based** — each `Compiler` has its own fonts and caches, safe for concurrent use.
 - **Custom fonts** — load any TTF/OTF when creating a `Compiler`, alongside the bundled defaults.
+- **File & import support** — `#import`, `#image()`, and 3rd-party packages work via `WithRoot` and `WithPackageDir` options.
 
 ## Prerequisites
 
@@ -83,6 +84,41 @@ doc, _ := c.CompileBytes([]byte(`#set text(font: "Inter"); Hello!`))
 defer doc.Close()
 ```
 
+### Compiling Files with Imports & Images
+
+```go
+c, _ := typst.New()
+defer c.Close()
+
+// CompileFile auto-derives root from the file's directory.
+doc, err := c.CompileFile("docs/report.typ")
+if err != nil {
+    panic(err)
+}
+defer doc.Close()
+```
+
+Any `#import "helper.typ"` or `#image("logo.png")` in `report.typ` will resolve relative to `docs/`.
+
+### Using Typst Packages
+
+```go
+// Packages from the system cache (~/.cache/typst/packages/ on Linux,
+// ~/Library/Caches/typst/packages/ on macOS) are auto-detected.
+doc, _ := c.CompileFile("docs/report.typ")
+
+// Or point to a custom package directory:
+doc, _ = c.CompileBytes(source, typst.WithPackageDir("/path/to/packages"))
+```
+
+### WithRoot for Inline Source
+
+```go
+// When compiling source bytes (not a file), set root explicitly:
+source := []byte(`#image("logo.png")`)
+doc, _ := c.CompileBytes(source, typst.WithRoot("/path/to/assets"))
+```
+
 ### Multiple Independent Compilers
 
 ```go
@@ -104,16 +140,32 @@ Creates a new independent compiler instance. Bundled fonts (Libertinus Serif, Ne
 ### `type Compiler`
 
 ```go
-func (c *Compiler) Compile(r io.Reader) (*Document, error)    // from io.Reader
-func (c *Compiler) CompileBytes(source []byte) (*Document, error) // from []byte (fastest)
-func (c *Compiler) Close() error                               // frees all resources
+func (c *Compiler) Compile(r io.Reader, opts ...CompileOption) (*Document, error)
+func (c *Compiler) CompileBytes(source []byte, opts ...CompileOption) (*Document, error)
+func (c *Compiler) CompileFile(path string, opts ...CompileOption) (*Document, error)
+func (c *Compiler) Close() error
 ```
 
-- **`Compile(r)`** — reads all bytes from `r`, compiles to PDF.
-- **`CompileBytes(b)`** — compiles directly from a byte slice. Fastest path — avoids `io.ReadAll`.
+- **`Compile(r, opts...)`** — reads all bytes from `r`, compiles to PDF.
+- **`CompileBytes(b, opts...)`** — compiles directly from a byte slice. Fastest path — avoids `io.ReadAll`.
+- **`CompileFile(path, opts...)`** — reads and compiles a `.typ` file. The file's directory is automatically used as root for resolving imports and images, unless overridden with `WithRoot`.
 - **`Close()`** — frees the compiler and all its internal resources. Idempotent. A runtime finalizer acts as safety net.
 
 A `Compiler` is safe for concurrent use from multiple goroutines.
+
+### `type CompileOption`
+
+```go
+func WithRoot(dir string) CompileOption
+func WithPackageDir(dir string) CompileOption
+```
+
+- **`WithRoot(dir)`** — sets the root directory for resolving `#import` and `#image()` paths. Path traversal outside the root is blocked.
+- **`WithPackageDir(dir)`** — overrides the default package cache directory. Packages are resolved at `{dir}/{namespace}/{name}/{version}/`.
+
+### `func DefaultPackageDir() string`
+
+Returns the platform-specific default Typst package cache directory (`~/.cache/typst/packages/` on Linux, `~/Library/Caches/typst/packages/` on macOS). Respects `XDG_CACHE_HOME`.
 
 ### `type Document`
 
@@ -231,7 +283,6 @@ make test
 
 ## Limitations
 
-- **Single-file only**: no support for `#import` of other Typst files or packages.
-- **No external files**: the `file()` World method returns "not found" — embedded images from external paths won't work.
+- **No automatic package download**: packages must already be in the cache (e.g. installed via the `typst` CLI). This library resolves packages from the local filesystem only.
 - **Fonts fixed at creation**: fonts are loaded once when the `Compiler` is created via `New()` and cannot be changed afterwards.
-- **macOS/Linux**: tested on macOS (arm64). Linux should work but may need adjustments to linker flags.
+- **macOS/Linux**: tested on macOS (arm64) and Linux (amd64).

@@ -20,7 +20,12 @@ typedef struct {
 TypstWorld *typst_world_new(const uint8_t **font_ptrs, const size_t *font_lens, size_t font_count);
 
 // Compile a Typst source string to PDF.
-TypstResult typst_world_compile(const TypstWorld *world, const uint8_t *source_ptr, size_t source_len);
+// root_ptr/root_len: optional root directory for local file resolution (NULL/0 = disabled).
+// pkg_ptr/pkg_len: optional package cache directory (NULL/0 = disabled).
+TypstResult typst_world_compile(const TypstWorld *world,
+    const uint8_t *source_ptr, size_t source_len,
+    const uint8_t *root_ptr, size_t root_len,
+    const uint8_t *pkg_ptr, size_t pkg_len);
 
 // Free a compiler instance.
 void typst_world_free(TypstWorld *world);

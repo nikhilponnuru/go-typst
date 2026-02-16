@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::slice;
 
 use chrono::{Datelike, Local};
@@ -61,14 +62,61 @@ impl SharedResources {
 struct SingleSourceWorld<'a> {
     shared: &'a SharedResources,
     source: Source,
+    root: Option<PathBuf>,
+    package_cache: Option<PathBuf>,
 }
 
 impl<'a> SingleSourceWorld<'a> {
-    fn new(shared: &'a SharedResources, source_text: String) -> Self {
+    fn new(
+        shared: &'a SharedResources,
+        source_text: String,
+        root: Option<PathBuf>,
+        package_cache: Option<PathBuf>,
+    ) -> Self {
         SingleSourceWorld {
             shared,
             source: Source::new(shared.main_id, source_text),
+            root,
+            package_cache,
         }
+    }
+
+    /// Resolve a FileId to an absolute path on disk, with path traversal protection.
+    fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
+        let vpath = id.vpath().as_rootless_path();
+
+        let base = if let Some(pkg) = id.package() {
+            // Package file: {cache}/{namespace}/{name}/{version}/
+            let cache = self.package_cache.as_ref().ok_or_else(|| {
+                FileError::NotFound(vpath.into())
+            })?;
+            cache
+                .join(pkg.namespace.as_str())
+                .join(pkg.name.as_str())
+                .join(pkg.version.to_string())
+        } else {
+            // Local file: resolve relative to root.
+            self.root.as_ref().ok_or_else(|| {
+                FileError::NotFound(vpath.into())
+            })?.clone()
+        };
+
+        let full = base.join(vpath);
+
+        // Canonicalize to resolve symlinks and ../ components.
+        let canonical = full.canonicalize().map_err(|_| {
+            FileError::NotFound(vpath.into())
+        })?;
+
+        // Path traversal protection: ensure resolved path is within base.
+        let canonical_base = base.canonicalize().map_err(|_| {
+            FileError::NotFound(vpath.into())
+        })?;
+        if !canonical.starts_with(&canonical_base) {
+            return Err(FileError::AccessDenied);
+        }
+
+        Ok(canonical)
     }
 }
 
@@ -87,14 +135,22 @@ impl World for SingleSourceWorld<'_> {
 
     fn source(&self, id: FileId) -> FileResult<Source> {
         if id == self.source.id() {
-            Ok(self.source.clone())
-        } else {
-            Err(FileError::NotFound(id.vpath().as_rootless_path().into()))
+            return Ok(self.source.clone());
         }
+
+        let path = self.resolve_path(id)?;
+        let text = std::fs::read_to_string(&path).map_err(|_| {
+            FileError::NotFound(id.vpath().as_rootless_path().into())
+        })?;
+        Ok(Source::new(id, text))
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        Err(FileError::NotFound(id.vpath().as_rootless_path().into()))
+        let path = self.resolve_path(id)?;
+        let data = std::fs::read(&path).map_err(|_| {
+            FileError::NotFound(id.vpath().as_rootless_path().into())
+        })?;
+        Ok(Bytes::new(data))
     }
 
     fn font(&self, index: usize) -> Option<Font> {
@@ -165,12 +221,18 @@ pub unsafe extern "C" fn typst_world_new(
 /// # Safety
 /// - `world` must be a valid pointer from `typst_world_new`.
 /// - `source_ptr` must point to `source_len` valid UTF-8 bytes.
+/// - `root_ptr`/`root_len`: optional root directory for local file resolution (NULL/0 = disabled).
+/// - `pkg_ptr`/`pkg_len`: optional package cache directory (NULL/0 = disabled).
 /// - Free the result with `typst_free_result`.
 #[no_mangle]
 pub unsafe extern "C" fn typst_world_compile(
     world: *const TypstWorld,
     source_ptr: *const u8,
     source_len: usize,
+    root_ptr: *const u8,
+    root_len: usize,
+    pkg_ptr: *const u8,
+    pkg_len: usize,
 ) -> TypstResult {
     let shared = unsafe { &*world };
 
@@ -182,7 +244,27 @@ pub unsafe extern "C" fn typst_world_compile(
         }
     };
 
-    let world = SingleSourceWorld::new(shared, source_text);
+    let root = if !root_ptr.is_null() && root_len > 0 {
+        let bytes = unsafe { slice::from_raw_parts(root_ptr, root_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => Some(PathBuf::from(s)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let package_cache = if !pkg_ptr.is_null() && pkg_len > 0 {
+        let bytes = unsafe { slice::from_raw_parts(pkg_ptr, pkg_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => Some(PathBuf::from(s)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let world = SingleSourceWorld::new(shared, source_text, root, package_cache);
     let result = typst::compile::<PagedDocument>(&world);
 
     let warnings: Vec<String> = result
