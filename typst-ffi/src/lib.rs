@@ -11,7 +11,7 @@ use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 
 /// Shared, immutable resources owned by a compiler instance.
-struct SharedResources {
+pub struct SharedResources {
     library: LazyHash<Library>,
     book: LazyHash<FontBook>,
     fonts: Vec<Font>,
