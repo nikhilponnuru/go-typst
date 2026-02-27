@@ -83,24 +83,6 @@ func DefaultPackageDir() string {
 	return defaultPkgDir.dir
 }
 
-var defaultPkgDirExists struct {
-	once sync.Once
-	dir  string // empty if not found or not a directory
-}
-
-// defaultPackageDirIfExists returns DefaultPackageDir() if it exists on disk,
-// or "" otherwise. The os.Stat check is performed once and cached.
-func defaultPackageDirIfExists() string {
-	defaultPkgDirExists.once.Do(func() {
-		if dir := DefaultPackageDir(); dir != "" {
-			if info, err := os.Stat(dir); err == nil && info.IsDir() {
-				defaultPkgDirExists.dir = dir
-			}
-		}
-	})
-	return defaultPkgDirExists.dir
-}
-
 // CompileError represents a Typst compilation error.
 type CompileError struct {
 	Message string
@@ -222,7 +204,11 @@ func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, erro
 
 	// Auto-detect default package dir if not explicitly set.
 	if cfg.packageDir == "" {
-		cfg.packageDir = defaultPackageDirIfExists()
+		if dir := DefaultPackageDir(); dir != "" {
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				cfg.packageDir = dir
+			}
+		}
 	}
 
 	// Prepare C pointers for root.
